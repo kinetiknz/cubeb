@@ -53,6 +53,9 @@ int sndio_init(cubeb ** context, char const * context_name);
 #if defined(USE_OPENSL)
 int opensl_init(cubeb ** context, char const * context_name);
 #endif
+#if defined(USE_OSS)
+int oss_init(cubeb ** context, char const * context_name);
+#endif
 #if defined(USE_AUDIOTRACK)
 int audiotrack_init(cubeb ** context, char const * context_name);
 #endif
@@ -118,6 +121,9 @@ cubeb_init(cubeb ** context, char const * context_name)
 #endif
 #if defined(USE_OPENSL)
     opensl_init,
+#endif
+#if defined(USE_OSS)
+    oss_init,
 #endif
 #if defined(USE_AUDIOTRACK)
     audiotrack_init,
