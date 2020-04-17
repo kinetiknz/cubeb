@@ -183,6 +183,19 @@ private:
   T * ptr = nullptr;
 };
 
+LONG wasapi_stream_add_ref(cubeb_stream * stm);
+LONG wasapi_stream_release(cubeb_stream * stm);
+
+struct auto_stream_ref {
+  auto_stream_ref(cubeb_stream * stm_) : stm(stm_) {
+    wasapi_stream_add_ref(stm);
+  }
+  ~auto_stream_ref() {
+    wasapi_stream_release(stm);
+  }
+  cubeb_stream * stm;
+};
+
 extern cubeb_ops const wasapi_ops;
 
 int wasapi_stream_stop(cubeb_stream * stm);
@@ -287,8 +300,8 @@ struct cubeb_stream {
   com_ptr<IAudioClient> input_client;
   /* Interface to use the event driven capture interface */
   com_ptr<IAudioCaptureClient> capture_client;
-  /* This event is set by the stream_stop and stream_destroy
-     function, so the render loop can exit properly. */
+  /* This event is set by the stream_destroy function, so the render loop can
+     exit properly. */
   HANDLE shutdown_event = 0;
   /* Set by OnDefaultDeviceChanged when a stream reconfiguration is required.
      The reconfiguration is handled by the render loop thread. */
@@ -329,11 +342,12 @@ struct cubeb_stream {
   float volume = 1.0;
   /* True if the stream is draining. */
   bool draining = false;
-  /* True when we've destroyed the stream. This pointer is leaked on stream
-   * destruction if we could not join the thread. */
-  std::atomic<std::atomic<bool>*> emergency_bailout { nullptr };
-  /* Synchronizes render thread start to ensure safe access to emergency_bailout. */
+  /* This is set by the render loop thread once it has obtained a reference to
+   * COM and this stream object. */
   HANDLE thread_ready_event = 0;
+  /* Keep a ref count on this stream object. After both stream_destroy has been
+   * called and the render loop thread has exited, destroy this stream object. */
+  LONG ref_count = 0;
 };
 
 class monitor_device_notifications {
@@ -1152,9 +1166,20 @@ static unsigned int __stdcall
 wasapi_stream_render_loop(LPVOID stream)
 {
   cubeb_stream * stm = static_cast<cubeb_stream *>(stream);
-  std::atomic<bool> * emergency_bailout = stm->emergency_bailout;
 
-  // Signal wasapi_stream_start that we've copied emergency_bailout.
+  auto_stream_ref stream_ref(stm);
+  struct auto_com {
+    auto_com() {
+      HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      XASSERT(SUCCEEDED(hr));
+    }
+    ~auto_com() {
+      CoUninitialize();
+    }
+  } com;
+
+  // Signal wasapi_stream_start that we've initialized COM and incremented
+  // the stream's ref_count.
   BOOL ok = SetEvent(stm->thread_ready_event);
   if (!ok) {
     LOG("thread_ready SetEvent failed: %lx", GetLastError());
@@ -1171,15 +1196,6 @@ wasapi_stream_render_loop(LPVOID stream)
   HANDLE mmcss_handle = NULL;
   HRESULT hr = 0;
   DWORD mmcss_task_index = 0;
-  struct auto_com {
-    auto_com() {
-      HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-      XASSERT(SUCCEEDED(hr));
-    }
-    ~auto_com() {
-      CoUninitialize();
-    }
-  } com;
 
   /* We could consider using "Pro Audio" here for WebAudio and
      maybe WebRTC. */
@@ -1189,31 +1205,11 @@ wasapi_stream_render_loop(LPVOID stream)
     LOG("Unable to use mmcss to bump the render thread priority: %lx", GetLastError());
   }
 
-  /* WaitForMultipleObjects timeout can trigger in cases where we don't want to
-     treat it as a timeout, such as across a system sleep/wake cycle.  Trigger
-     the timeout error handling only when the timeout_limit is reached, which is
-     reset on each successful loop. */
-  unsigned timeout_count = 0;
-  const unsigned timeout_limit = 3;
   while (is_playing) {
-    // We want to check the emergency bailout variable before a
-    // and after the WaitForMultipleObject, because the handles WaitForMultipleObjects
-    // is going to wait on might have been closed already.
-    if (*emergency_bailout) {
-      delete emergency_bailout;
-      return 0;
-    }
     DWORD waitResult = WaitForMultipleObjects(ARRAY_LENGTH(wait_array),
                                               wait_array,
                                               FALSE,
-                                              1000);
-    if (*emergency_bailout) {
-      delete emergency_bailout;
-      return 0;
-    }
-    if (waitResult != WAIT_TIMEOUT) {
-      timeout_count = 0;
-    }
+                                              INFINITE);
     switch (waitResult) {
     case WAIT_OBJECT_0: { /* shutdown */
       is_playing = false;
@@ -1228,12 +1224,13 @@ wasapi_stream_render_loop(LPVOID stream)
       XASSERT(stm->output_client || stm->input_client);
       LOG("Reconfiguring the stream");
       /* Close the stream */
+      bool was_running = false;
       if (stm->output_client) {
-        stm->output_client->Stop();
+        was_running = stm->output_client->Stop() == S_OK;
         LOG("Output stopped.");
       }
       if (stm->input_client) {
-        stm->input_client->Stop();
+        was_running = stm->input_client->Stop() == S_OK;
         LOG("Input stopped.");
       }
       {
@@ -1254,7 +1251,7 @@ wasapi_stream_render_loop(LPVOID stream)
         LOG("Stream setup successfuly.");
       }
       XASSERT(stm->output_client || stm->input_client);
-      if (stm->output_client) {
+      if (was_running && stm->output_client) {
         hr = stm->output_client->Start();
         if (FAILED(hr)) {
           LOG("Error starting output after reconfigure, error: %lx", hr);
@@ -1263,7 +1260,7 @@ wasapi_stream_render_loop(LPVOID stream)
         }
         LOG("Output started after reconfigure.");
       }
-      if (stm->input_client) {
+      if (was_running && stm->input_client) {
         hr = stm->input_client->Start();
         if (FAILED(hr)) {
           LOG("Error starting input after reconfiguring, error: %lx", hr);
@@ -1282,14 +1279,6 @@ wasapi_stream_render_loop(LPVOID stream)
     case WAIT_OBJECT_0 + 3: /* input available */
       if (has_input(stm) && has_output(stm)) { continue; }
       is_playing = stm->refill_callback(stm);
-      break;
-    case WAIT_TIMEOUT:
-      XASSERT(stm->shutdown_event == wait_array[0]);
-      if (++timeout_count >= timeout_limit) {
-        LOG("Render loop reached the timeout limit.");
-        is_playing = false;
-        hr = E_FAIL;
-      }
       break;
     default:
       LOG("case %lu not handled in render loop.", waitResult);
@@ -1543,12 +1532,6 @@ bool stop_and_join_render_thread(cubeb_stream * stm)
     return true;
   }
 
-  // If we've already leaked the thread, just return,
-  // there is not much we can do.
-  if (!stm->emergency_bailout.load()) {
-    return false;
-  }
-
   BOOL ok = SetEvent(stm->shutdown_event);
   if (!ok) {
     LOG("Destroy SetEvent failed: %lx", GetLastError());
@@ -1560,23 +1543,8 @@ bool stop_and_join_render_thread(cubeb_stream * stm)
   if (r != WAIT_OBJECT_0) {
     /* Something weird happened, leak the thread and continue the shutdown
      * process. */
-    *(stm->emergency_bailout) = true;
-    // We give the ownership to the rendering thread.
-    stm->emergency_bailout = nullptr;
     LOG("Destroy WaitForSingleObject on thread failed: %lx, %lx", r, GetLastError());
     rv = false;
-  }
-
-  // Only attempts to close and null out the thread and event if the
-  // WaitForSingleObject above succeeded, so that calling this function again
-  // attemps to clean up the thread and event each time.
-  if (rv) {
-    LOG("Closing thread.");
-    CloseHandle(stm->thread);
-    stm->thread = NULL;
-
-    CloseHandle(stm->shutdown_event);
-    stm->shutdown_event = 0;
   }
 
   return rv;
@@ -2266,7 +2234,8 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
     return CUBEB_ERROR_INVALID_FORMAT;
   }
 
-  std::unique_ptr<cubeb_stream, decltype(&wasapi_stream_destroy)> stm(new cubeb_stream(), wasapi_stream_destroy);
+  cubeb_stream * stm = new cubeb_stream();
+  auto_stream_ref stream_ref(stm);
 
   stm->context = context;
   stm->data_callback = data_callback;
@@ -2325,12 +2294,24 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
     return CUBEB_ERROR;
   }
 
+  stm->shutdown_event = CreateEvent(NULL, 0, 0, NULL);
+  if (!stm->shutdown_event) {
+    LOG("Can't create the shutdown event, error: %lx", GetLastError());
+    return CUBEB_ERROR;
+  }
+
+  stm->thread_ready_event = CreateEvent(NULL, 0, 0, NULL);
+  if (!stm->thread_ready_event) {
+    LOG("Can't create the thread ready event, error: %lx", GetLastError());
+    return CUBEB_ERROR;
+  }
+
   {
     /* Locking here is not strictly necessary, because we don't have a
        notification client that can reset the stream yet, but it lets us
        assert that the lock is held in the function. */
     auto_lock lock(stm->stream_reset_lock);
-    rv = setup_wasapi_stream(stm.get());
+    rv = setup_wasapi_stream(stm);
   }
   if (rv != CUBEB_OK) {
     return rv;
@@ -2340,7 +2321,7 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
          (input_stream_params->prefs & CUBEB_STREAM_PREF_DISABLE_DEVICE_SWITCHING) : 0) ||
         (output_stream_params ?
          (output_stream_params->prefs & CUBEB_STREAM_PREF_DISABLE_DEVICE_SWITCHING) : 0))) {
-    HRESULT hr = register_notification_client(stm.get());
+    HRESULT hr = register_notification_client(stm);
     if (FAILED(hr)) {
       /* this is not fatal, we can still play audio, but we won't be able
          to keep using the default audio endpoint if it changes. */
@@ -2348,7 +2329,23 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
     }
   }
 
-  *stream = stm.release();
+
+  cubeb_async_log_reset_threads();
+  stm->thread = (HANDLE) _beginthreadex(NULL, 512 * 1024, wasapi_stream_render_loop, stm, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+  if (stm->thread == NULL) {
+    LOG("could not create WASAPI render thread.");
+    return CUBEB_ERROR;
+  }
+
+  // Wait for the wasapi_stream_render_loop thread to signal that COM has been
+  // initialized and the stream's ref_count has been incremented.
+  HRESULT hr = WaitForSingleObject(stm->thread_ready_event, INFINITE);
+  XASSERT(hr == WAIT_OBJECT_0);
+  CloseHandle(stm->thread_ready_event);
+  stm->thread_ready_event = 0;
+
+  wasapi_stream_add_ref(stm);
+  *stream = stm;
 
   LOG("Stream init succesfull (%p)", *stream);
   return CUBEB_OK;
@@ -2378,37 +2375,55 @@ void close_wasapi_stream(cubeb_stream * stm)
   stm->mix_buffer.clear();
 }
 
+LONG
+wasapi_stream_add_ref(cubeb_stream * stm) {
+  XASSERT(stm);
+  LONG result = InterlockedIncrement(&stm->ref_count);
+  LOGV("Stream ref count incremented = %i (%p)", result, stm);
+  return result;
+}
+
+LONG wasapi_stream_release(cubeb_stream * stm) {
+  XASSERT(stm);
+
+  LONG result = InterlockedDecrement(&stm->ref_count);
+  LOGV("Stream ref count decremented = %i (%p)", result, stm);
+  if (result == 0) {
+    LOG("Stream ref count hit zero, destroying (%p)", stm);
+
+    if (stm->notification_client) {
+      unregister_notification_client(stm);
+    }
+
+    CloseHandle(stm->shutdown_event);
+    CloseHandle(stm->reconfigure_event);
+    CloseHandle(stm->refill_event);
+    CloseHandle(stm->input_available_event);
+
+    CloseHandle(stm->thread);
+
+    // The variables intialized in wasapi_stream_init,
+    // must be destroyed in wasapi_stream_release.
+    stm->linear_input_buffer.reset();
+
+    {
+      auto_lock lock(stm->stream_reset_lock);
+      close_wasapi_stream(stm);
+    }
+
+    delete stm;
+  }
+
+  return result;
+}
+
 void wasapi_stream_destroy(cubeb_stream * stm)
 {
   XASSERT(stm);
-  LOG("Stream destroy (%p)", stm);
+  LOG("Stream destroy called, decrementing ref count (%p)", stm);
 
-  // Only free stm->emergency_bailout if we could join the thread.
-  // If we could not join the thread, stm->emergency_bailout is true
-  // and is still alive until the thread wakes up and exits cleanly.
-  if (stop_and_join_render_thread(stm)) {
-    delete stm->emergency_bailout.load();
-    stm->emergency_bailout = nullptr;
-  }
-
-  if (stm->notification_client) {
-    unregister_notification_client(stm);
-  }
-
-  CloseHandle(stm->reconfigure_event);
-  CloseHandle(stm->refill_event);
-  CloseHandle(stm->input_available_event);
-
-  // The variables intialized in wasapi_stream_init,
-  // must be destroyed in wasapi_stream_destroy.
-  stm->linear_input_buffer.reset();
-
-  {
-    auto_lock lock(stm->stream_reset_lock);
-    close_wasapi_stream(stm);
-  }
-
-  delete stm;
+  stop_and_join_render_thread(stm);
+  wasapi_stream_release(stm);
 }
 
 enum StreamDirection {
@@ -2458,10 +2473,8 @@ int wasapi_stream_start(cubeb_stream * stm)
 {
   auto_lock lock(stm->stream_reset_lock);
 
-  XASSERT(stm && !stm->thread && !stm->shutdown_event);
+  XASSERT(stm);
   XASSERT(stm->output_client || stm->input_client);
-
-  stm->emergency_bailout = new std::atomic<bool>(false);
 
   if (stm->output_client) {
     int rv = stream_start_one_side(stm, OUTPUT);
@@ -2476,33 +2489,6 @@ int wasapi_stream_start(cubeb_stream * stm)
       return rv;
     }
   }
-
-  stm->shutdown_event = CreateEvent(NULL, 0, 0, NULL);
-  if (!stm->shutdown_event) {
-    LOG("Can't create the shutdown event, error: %lx", GetLastError());
-    return CUBEB_ERROR;
-  }
-
-  stm->thread_ready_event = CreateEvent(NULL, 0, 0, NULL);
-  if (!stm->thread_ready_event) {
-    LOG("Can't create the thread_ready event, error: %lx", GetLastError());
-    return CUBEB_ERROR;
-  }
-
-  cubeb_async_log_reset_threads();
-  stm->thread = (HANDLE) _beginthreadex(NULL, 512 * 1024, wasapi_stream_render_loop, stm, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-  if (stm->thread == NULL) {
-    LOG("could not create WASAPI render thread.");
-    return CUBEB_ERROR;
-  }
-
-  // Wait for wasapi_stream_render_loop to signal that emergency_bailout has
-  // been read, avoiding a bailout situation where we could free `stm`
-  // before wasapi_stream_render_loop had a chance to run.
-  HRESULT hr = WaitForSingleObject(stm->thread_ready_event, INFINITE);
-  XASSERT(hr == WAIT_OBJECT_0);
-  CloseHandle(stm->thread_ready_event);
-  stm->thread_ready_event = 0;
 
   stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_STARTED);
 
@@ -2534,15 +2520,6 @@ int wasapi_stream_stop(cubeb_stream * stm)
     }
 
     stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_STOPPED);
-  }
-
-  if (stop_and_join_render_thread(stm)) {
-    delete stm->emergency_bailout.load();
-    stm->emergency_bailout = nullptr;
-  } else {
-    // If we could not join the thread, put the stream in error.
-    stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
-    return CUBEB_ERROR;
   }
 
   return CUBEB_OK;
